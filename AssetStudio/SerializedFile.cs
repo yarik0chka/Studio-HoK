@@ -102,6 +102,10 @@ namespace AssetStudio
             if (header.m_Version >= SerializedFileFormatVersion.HasTypeTreeHashes)
             {
                 m_EnableTypeTree = reader.ReadBoolean();
+                if (game.Type.IsHonorOfKings())
+                {
+                    m_EnableTypeTree = false;
+                }
             }
 
             // Read Types
@@ -111,6 +115,10 @@ namespace AssetStudio
             for (int i = 0; i < typeCount; i++)
             {
                 m_Types.Add(ReadSerializedType(false));
+                if (game.Type.IsHonorOfKings())
+                {
+                    var unk = reader.ReadInt32();
+                }
             }
 
             if (header.m_Version >= SerializedFileFormatVersion.Unknown_7 && header.m_Version < SerializedFileFormatVersion.Unknown_14)

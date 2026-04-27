@@ -19,6 +19,7 @@ namespace AssetStudio
         MhyFile,
         BlbFile,
         ENCRFile,
-        BlockFile
+        BlockFile,
+        QtsVFSFile
     }
 }

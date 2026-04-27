@@ -106,6 +106,10 @@ namespace AssetStudio
                         }
                     }
                     var m_MotionVectors = reader.ReadByte();
+                    if (reader.Game.Type.IsHonorOfKings())
+                    {
+                        var m_GIType = reader.ReadByte();
+                    }
                     var m_LightProbeUsage = reader.ReadByte();
                     var m_ReflectionProbeUsage = reader.ReadByte();
                     if (version[0] > 2019 || (version[0] == 2019 && version[1] >= 3)) //2019.3 and up
@@ -115,6 +119,10 @@ namespace AssetStudio
                     if (version[0] >= 2020) //2020.1 and up
                     {
                         var m_RayTraceProcedural = reader.ReadByte();
+                    }
+                    if (reader.Game.Type.IsHonorOfKings())
+                    {
+                        var m_UseShadowMask = reader.ReadByte();
                     }
                     if (reader.Game.Type.IsGI() || reader.Game.Type.IsGICB3() || reader.Game.Type.IsGICB3Pre())
                     {
@@ -158,7 +166,16 @@ namespace AssetStudio
             {
                 var m_LightmapTilingOffsetDynamic = reader.ReadVector4();
             }
-
+            
+            if (reader.Game.Type.IsHonorOfKings())
+            {
+                var m_YarpLightmapScaleAndOffset = reader.ReadVector4();
+                var m_YarpLightmapEncodeScale = reader.ReadVector4();
+                var m_YarpLightmapEncodeAdd =  reader.ReadVector3();
+                var m_YarpLightmapUseEncoding = reader.ReadByte();
+                reader.AlignStream();
+            }
+            
             if (reader.Game.Type.IsGIGroup())
             {
                 var m_ViewDistanceRatio = reader.ReadSingle();

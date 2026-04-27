@@ -56,6 +56,15 @@ namespace AssetStudio
                     assetsFile.assetsManager.resourceFileReaders.TryAdd(resourceFileName, reader);
                     return reader;
                 }
+                if (assetsFile.game.Type.IsHonorOfKings())
+                {
+                    var hashedPath = QtsVFSFile.Compute(path, true);
+                    if (assetsFile.assetsManager.resourceFileReaders.TryGetValue(hashedPath.ToString(), out reader))
+                    {
+                        needSearch = false;
+                        return reader;
+                    }
+                }
                 throw new FileNotFoundException($"Can't find the resource file {resourceFileName}");
             }
             else

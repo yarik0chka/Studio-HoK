@@ -6,6 +6,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using ZstdSharp;
 using static AssetStudio.ImportHelper;
 
 namespace AssetStudio
@@ -143,6 +144,9 @@ namespace AssetStudio
                 case FileType.MhyFile:
                     LoadMhyFile(reader);
                     break;
+                case FileType.QtsVFSFile:
+                    LoadQtsVFS(reader);
+                    break;
             }
         }
 
@@ -162,6 +166,8 @@ namespace AssetStudio
                     {
                         Logger.Verbose($"{assetsFile.fileName} needs external file {sharedFile.fileName}, attempting to look it up...");
                         var sharedFileName = sharedFile.fileName;
+                        if (Game.Type.IsHonorOfKings() && string.IsNullOrEmpty(sharedFileName))
+                            continue;
 
                         if (!importFilesHash.Contains(sharedFileName))
                         {
@@ -520,6 +526,84 @@ namespace AssetStudio
                 {
                     str += $" from {Path.GetFileName(originalPath)}";
                 }
+                Logger.Error(str, e);
+            }
+            finally
+            {
+                reader.Dispose();
+            }
+        }
+
+        private void LoadQtsVFS(FileReader reader, string originalPath = null, long originalOffset = 0, bool log = true)
+        {
+            if (log)
+            {
+                Logger.Info("Loading " + reader.FullPath);
+            }
+
+            try
+            {
+                var qtsVFS = new QtsVFSFile(reader);
+
+                foreach (var entry in qtsVFS.Entries)
+                {
+                    var fileId = entry.Key;
+                    var chunks = entry.Value;
+                    var dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), fileId.ToString());
+
+                    var decompressed = new byte[chunks.Sum(c => c.UncompressedSize)];
+                    var decompressedOffset = 0;
+                    foreach (var chunk in chunks)
+                    {
+                        reader.Position = chunk.Offset;
+                        var compressed = reader.ReadBytes(chunk.CompressedSize);
+                        var decompressedChunk = decompressed.AsSpan(decompressedOffset, chunk.UncompressedSize);
+
+                        int numWrite;
+                        if (compressed[0] == 0x28 && compressed[1] == 0xB5 && compressed[2] == 0x2F && compressed[3] == 0xFD)
+                        {
+                            using var decompressor = new Decompressor();
+                            numWrite = decompressor.Unwrap(compressed, 0, compressed.Length, decompressed, decompressedOffset, decompressedChunk.Length);
+                        }
+                        else if (compressed[0] is 0x8C or 0xCC && compressed[1] is 0x0C)
+                        {
+                            numWrite = OozHelper.Decompress(compressed, decompressedChunk);
+                        }
+                        else
+                        {
+                            numWrite = LZ4.Instance.Decompress(compressed, decompressedChunk);
+                        }
+
+                        decompressedOffset += numWrite;
+                    }
+
+                    if (decompressedOffset != decompressed.Length)
+                    {
+                        Logger.Warning($"Failed to decompress {fileId}, expected total {decompressed.Length} bytes but got {decompressedOffset} bytes");
+                        continue;
+                    }
+
+
+                    var entryReader = new FileReader(dummyPath, new MemoryStream(decompressed));
+                    if (entryReader.FileType == FileType.AssetsFile)
+                    {
+                        LoadAssetsFile(entryReader);
+                    }
+                    else
+                    {
+                        Logger.Verbose("Caching resource stream");
+                        resourceFileReaders.TryAdd(fileId.ToString(), entryReader); //TODO
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                var str = $"Error while reading QtsVFSFile file {reader.FullPath}";
+                if (originalPath != null)
+                {
+                    str += $" from {Path.GetFileName(originalPath)}";
+                }
+
                 Logger.Error(str, e);
             }
             finally

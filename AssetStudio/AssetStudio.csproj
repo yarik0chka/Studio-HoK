@@ -20,5 +20,16 @@
   		<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
   	</None>
   </ItemGroup>
+
+    <ItemGroup>
+      <ContentWithTargetPath Include="Libraries\x64\ooz.dll">
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+          <TargetPath>x64\ooz.dll</TargetPath>
+      </ContentWithTargetPath>
+  </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\AssetStudio.PInvoke\AssetStudio.PInvoke.csproj" />
+    </ItemGroup>
 	
 </Project>

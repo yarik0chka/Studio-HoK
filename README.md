@@ -50,3 +50,6 @@ Special Thank to:
 - Radioegor146: [Asset-indexes](https://github.com/radioegor146/gi-asset-indexes) for recovered/updated asset_index's.
 - Ds5678: [AssetRipper](https://github.com/AssetRipper/AssetRipper)[[discord](https://discord.gg/XqXa53W2Yh)] for information about Asset Formats & Parsing.
 - mafaca: [uTinyRipper](https://github.com/mafaca/UtinyRipper) for `YAML` and `AnimationClipConverter`. 
+- Razmoth: [Studio](https://github.com/RazTools/Studio).
+- LongerWarrior: [CUE4Parse](https://github.com/FabianFG/CUE4Parse) for `QtsVFS` (db) format research.
+- VaDiM: for `SerializedFile` fix.

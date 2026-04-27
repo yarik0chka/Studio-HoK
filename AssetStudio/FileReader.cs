@@ -19,6 +19,7 @@ namespace AssetStudio
         private static readonly byte[] blbMagic = { 0x42, 0x6C, 0x62, 0x02 };
         private static readonly byte[] narakaMagic = { 0x15, 0x1E, 0x1C, 0x0D, 0x0D, 0x23, 0x21 };
         private static readonly byte[] gunfireMagic = { 0x7C, 0x6D, 0x79, 0x72, 0x27, 0x7A, 0x73, 0x78, 0x3F };
+        private static readonly byte[] qtsVFSMagic = { 0x01, 0x00, 0x00, 0x02, 0x01, 0x02, 0x03, 0x04 };
 
 
         public FileReader(string path) : this(path, File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) { }
@@ -107,6 +108,11 @@ namespace AssetStudio
                             Position = 0x32;
                             return FileType.BundleFile;
                         }
+                        if (qtsVFSMagic.SequenceEqual(ReadBytes(8)))
+                        {
+                            return FileType.QtsVFSFile;
+                        }
+                        Position = 0;
                         Logger.Verbose($"Parsed signature does not match with expected signature {Convert.ToHexString(gunfireMagic)}");
                         Logger.Verbose($"Parsed signature does not match any of the supported signatures, assuming resource file");
                         return FileType.ResourceFile;
