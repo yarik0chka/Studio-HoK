@@ -76,7 +76,9 @@ public class QtsVFSFile
             reader.Position += compressedSize;
             reader.AlignStream(4);
             var id = reader.ReadUInt64();
-            var entry = new FHoKCompressedChunk(offset, compressedSize, uncompressedSize, reader.ReadInt32(), reader.ReadInt32());
+            var mainBlock = reader.ReadInt32();  // Main block sequence number
+            var subBlock = reader.ReadInt32();   // Sub block sequence number
+            var entry = new FHoKCompressedChunk(offset, compressedSize, uncompressedSize, mainBlock, subBlock);
 
             if (result.TryGetValue(id, out var list))
             {
@@ -195,16 +197,16 @@ public class QtsVFSFile
         public readonly long Offset;
         public readonly int CompressedSize;
         public readonly int UncompressedSize;
-        public readonly int Padding;
-        public readonly int Index;
+        public readonly int MainBlock;  // Main block sequence number, used for sorting
+        public readonly int SubBlock;   // Sub block sequence number, used for sorting
 
-        public FHoKCompressedChunk(long offset, int compessedSize, int uncompressedSize, int padding, int index)
+        public FHoKCompressedChunk(long offset, int compressedSize, int uncompressedSize, int mainBlock, int subBlock)
         {
             Offset = offset;
-            CompressedSize = compessedSize;
+            CompressedSize = compressedSize;
             UncompressedSize = uncompressedSize;
-            Padding = padding;
-            Index = index;
+            MainBlock = mainBlock;
+            SubBlock = subBlock;
         }
     }
 
