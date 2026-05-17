@@ -549,6 +549,12 @@ namespace AssetStudio
                 {
                     var fileId = entry.Key;
                     var chunks = entry.Value;
+                    // Sort by MainBlock and SubBlock to ensure correct file reassembly order
+                    chunks.Sort((a, b) =>
+                    {
+                        int result = a.MainBlock.CompareTo(b.MainBlock);
+                        return result != 0 ? result : a.SubBlock.CompareTo(b.SubBlock);
+                    });
                     var dummyPath = Path.Combine(Path.GetDirectoryName(reader.FullPath), fileId.ToString());
 
                     var decompressed = new byte[chunks.Sum(c => c.UncompressedSize)];
@@ -752,6 +758,9 @@ namespace AssetStudio
                             .AppendLine($"Path {assetsFile.originalPath}")
                             .AppendLine($"Type {objectReader.type}")
                             .AppendLine($"PathID {objectInfo.m_PathID}")
+                            .AppendLine($"ByteStart 0x{objectReader.byteStart:X8}")
+                            .AppendLine($"CurrentPosition 0x{objectReader.Position:X8}")
+                            .AppendLine($"ObjectOffset 0x{objectReader.Position - objectReader.byteStart:X8}")
                             .Append(e);
                         Logger.Error(sb.ToString());
                     }
