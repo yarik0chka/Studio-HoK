@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 
 namespace AssetStudio
 {
@@ -494,7 +493,7 @@ namespace AssetStudio
             if (version[0] == 2022 && version[1] >= 2) //2022.2 and up
             {
                 flags = reader.ReadInt32();
-        }
+            }
         }
 
         public YAMLNode ExportYAML(int[] version)
@@ -650,6 +649,11 @@ namespace AssetStudio
             node.Add(nameof(m_Center), m_Center.ExportYAML(version));
             node.Add(nameof(m_Extent), m_Extent.ExportYAML(version));
             return node;
+        }
+        public AABB(Vector3 center, Vector3 extent)
+        {
+            m_Center = center;
+            m_Extent = extent;
         }
     }
 
@@ -1082,6 +1086,8 @@ namespace AssetStudio
         public float m_SampleRate;
         public float m_BeginTime;
         public float[] m_SampleArray;
+        public ushort[] m_HokCompressedSamples;
+        public List<HokDenseRange> m_HokRanges;
         public DenseClip() { }
 
         public DenseClip(ObjectReader reader)
@@ -1091,6 +1097,29 @@ namespace AssetStudio
             m_SampleRate = reader.ReadSingle();
             m_BeginTime = reader.ReadSingle();
             m_SampleArray = reader.ReadSingleArray();
+            if (HokAnimationLayout.Applies(reader))
+            {
+                m_HokCompressedSamples = reader.ReadUInt16Array();
+                reader.AlignStream();
+                int count = reader.ReadInt32();
+                if (count < 0 || count > reader.byteSize / 12)
+                {
+                    throw new InvalidDataException("Invalid HOK range count.");
+                }
+                m_HokRanges = new List<HokDenseRange>();
+                for (int i = 0; i < count; i++)
+                {
+                    m_HokRanges.Add(new HokDenseRange(reader));
+                }
+                if (m_HokCompressedSamples.Length > 0)
+                {
+                    if (m_SampleArray.Length != 0)
+                    {
+                        throw new InvalidDataException("Both HOK dense encodings are populated.");
+                    }
+                    m_SampleArray = HokLegacyAnimation.DecodeHokSamples(m_FrameCount, m_CurveCount, m_HokCompressedSamples, m_HokRanges);
+                }
+            }
         }
         public static DenseClip ParseGI(ObjectReader reader)
         {
@@ -1268,6 +1297,496 @@ namespace AssetStudio
         }
     }
 
+    /// <summary>
+    /// Honor of Kings (王者荣耀) modified engine layout gate.
+    /// The 2022.3.5 engine revision stores extra data in AnimationClip, Clip and
+    /// DenseClip. Other revisions are not known to use the same layout.
+    /// </summary>
+    public static class HokAnimationLayout
+    {
+        public static bool Applies(ObjectReader reader)
+        {
+            var version = reader.version;
+            return reader.Game.Type.IsHonorOfKings()
+                && version.Length >= 2
+                && version[0] == 2022 && version[1] == 3;
+        }
+    }
+
+    /// <summary>
+    /// One HOK bit-packed dense group descriptor (12 bytes on disk).
+    ///   low  8 bits : group type (1 = quaternion, 2 = vector3, 3 = scalar)
+    ///   high 24 bits: bit width of each stored component (0 = full UInt16)
+    /// </summary>
+    public class HokDenseRange
+    {
+        public float minimum;
+        public float step;
+        public uint kind;
+
+        public int GroupType => (int)(kind & 255);
+        public int BitWidth => (int)(kind >> 8);
+        public int Dimension => GroupType == 1 ? 4 : GroupType == 2 ? 3 : GroupType == 3 ? 1 : throw new InvalidDataException($"Unknown HOK dense group kind: {kind}.");
+
+        public HokDenseRange() { }
+
+        public HokDenseRange(ObjectReader reader)
+        {
+            minimum = reader.ReadSingle();
+            step = reader.ReadSingle();
+            kind = reader.ReadUInt32();
+        }
+    }
+
+    /// <summary>
+    /// One entry of the HOK legacy (non humanoid) animation binding table.
+    /// The path is resolved from the outer name / path-index tables.
+    /// </summary>
+    public class HokLegacyBinding
+    {
+        public string attribute;
+        public PPtr<MonoScript> script;
+        public int classID;
+        public uint hash;
+        public string path;
+
+        public HokLegacyBinding(ObjectReader reader)
+        {
+            attribute = reader.ReadAlignedString();
+            script = new PPtr<MonoScript>(reader);
+            classID = reader.ReadInt32();
+            hash = reader.ReadUInt32();
+        }
+    }
+
+    /// <summary>
+    /// HOK legacy animation block, stored directly after m_Bounds.
+    /// It contains a full standalone <see cref="Clip"/> plus the path/binding table
+    /// that maps its curves onto scene objects.
+    /// </summary>
+    public class HokLegacyAnimation
+    {
+        public uint sizeField;
+        public Clip clip;
+        public uint? unknownWord;
+        public float startTime;
+        public float stopTime;
+        public string[] names;
+        public int[] pathIndices;
+        public List<HokLegacyBinding> bindings;
+
+        public HokLegacyAnimation(ObjectReader reader)
+        {
+            sizeField = reader.ReadUInt32();
+            clip = new Clip(reader);
+
+            // The older UInt16 layout has an additional word. Bit packed dense
+            // groups are followed directly by the clip time range.
+            var tail = reader.Position;
+            bool legacyWord = sizeField != 0
+                && clip.m_DenseClip.m_HokCompressedSamples.Length > 0
+                && !clip.m_DenseClip.m_HokRanges.Any(r => r.BitWidth != 0);
+            try
+            {
+                ReadTail(reader, legacyWord);
+            }
+            catch (Exception first) when (first is InvalidDataException || first is EndOfStreamException || first is OverflowException)
+            {
+                // Streamed/constant only clips exist in both revisions, so an empty
+                // dense table cannot identify the tail layout. Validate the complete
+                // name/path/binding tables at the alternate offset.
+                reader.Position = tail;
+                try
+                {
+                    ReadTail(reader, !legacyWord);
+                }
+                catch (Exception second) when (second is InvalidDataException || second is EndOfStreamException || second is OverflowException)
+                {
+                    throw new InvalidDataException($"Invalid HOK legacy tail in both layouts: {first.Message}; {second.Message}", second);
+                }
+            }
+        }
+
+        private void ReadTail(ObjectReader reader, bool extraWord)
+        {
+            unknownWord = extraWord ? reader.ReadUInt32() : (uint?)null;
+            startTime = reader.ReadSingle();
+            stopTime = reader.ReadSingle();
+            if (!float.IsFinite(startTime) || !float.IsFinite(stopTime) || stopTime < startTime)
+            {
+                throw new InvalidDataException("Invalid HOK legacy time interval.");
+            }
+            names = reader.ReadStringArray();
+            pathIndices = reader.ReadInt32Array();
+            int count = reader.ReadInt32();
+            if (count < 0 || count > reader.byteSize / 24)
+            {
+                throw new InvalidDataException("Invalid HOK legacy binding count.");
+            }
+
+            bindings = new List<HokLegacyBinding>();
+            var paths = new List<string>();
+            var path = new List<string>();
+            foreach (int index in pathIndices)
+            {
+                if (index == -1)
+                {
+                    paths.Add(string.Join("/", path));
+                    path.Clear();
+                }
+                else
+                {
+                    if (index < 0 || index >= names.Length)
+                    {
+                        throw new InvalidDataException("Invalid HOK legacy path index.");
+                    }
+                    path.Add(names[index]);
+                }
+            }
+            if (path.Count != 0 || paths.Count != count)
+            {
+                throw new InvalidDataException("HOK legacy paths/bindings mismatch.");
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                var binding = new HokLegacyBinding(reader) { path = paths[i] };
+                bindings.Add(binding);
+            }
+        }
+
+        /// <summary>
+        /// Dimension of one binding inside the HOK curve index space.
+        /// Transform bindings use the Unity binding codes, every other binding is scalar.
+        /// </summary>
+        public static int GetBindingDimension(HokLegacyBinding binding)
+        {
+            if (binding.classID == -1)
+            {
+                switch (binding.attribute)
+                {
+                    case "1": return 3; // kBindTransformPosition
+                    case "2": return 4; // kBindTransformRotation
+                    case "3": return 3; // kBindTransformScale
+                    case "4": return 3; // kBindTransformEuler
+                }
+            }
+            return 1;
+        }
+
+        private static readonly Quaternion HokQuaternionWeight = new Quaternion(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f);
+
+        private static bool IsRealTime(float time) => float.IsFinite(time) && Math.Abs(time) < float.MaxValue;
+
+        private static readonly Vector3 HokVector3Weight = new Vector3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f);
+        private static readonly Float HokFloatWeight = new Float(1.0f / 3.0f);
+
+        /// <summary>
+        /// Rebuilds the standard curve lists from the embedded clip. The stock exporters
+        /// only walk m_RotationCurves / m_PositionCurves / m_ScaleCurves / m_EulerCurves /
+        /// m_FloatCurves, which are empty on disk for HOK legacy clips.
+        ///
+        /// Curve index space (verified against every HOK legacy sample):
+        ///   streamed [0, streamedCurveCount)
+        ///   dense    [streamedCurveCount, + denseCurveCount)
+        ///   constant [streamedCurveCount + denseCurveCount, total)
+        /// where total equals the sum of all binding dimensions.
+        /// </summary>
+        public void BuildCurves(List<QuaternionCurve> rotations, List<Vector3Curve> positions,
+            List<Vector3Curve> scales, List<Vector3Curve> eulers, List<FloatCurve> floats)
+        {
+            if (clip == null || bindings == null || bindings.Count == 0)
+            {
+                return;
+            }
+
+            var dims = new int[bindings.Count];
+            int total = 0;
+            for (int i = 0; i < bindings.Count; i++)
+            {
+                dims[i] = GetBindingDimension(bindings[i]);
+                total += dims[i];
+            }
+
+            int streamedCount = (int)clip.m_StreamedClip.curveCount;
+            int denseCount = (int)clip.m_DenseClip.m_CurveCount;
+            int constantCount = clip.m_ConstantClip?.data?.Length ?? 0;
+            if (total != streamedCount + denseCount + constantCount)
+            {
+                // unknown revision of the block, never guess
+                return;
+            }
+
+            var bindingOfComponent = new int[total];
+            var componentInBinding = new int[total];
+            for (int i = 0, c = 0; i < bindings.Count; i++)
+            {
+                for (int k = 0; k < dims[i]; k++, c++)
+                {
+                    bindingOfComponent[c] = i;
+                    componentInBinding[c] = k;
+                }
+            }
+
+            var times = new List<float>[bindings.Count];
+            var rows = new List<float[]>[bindings.Count];
+
+            void AddSample(int component, float time, float value)
+            {
+                if (component < 0 || component >= total || !IsRealTime(time))
+                {
+                    return;
+                }
+                int b = bindingOfComponent[component];
+                if (times[b] == null)
+                {
+                    times[b] = new List<float>();
+                    rows[b] = new List<float[]>();
+                }
+                float[] row;
+                if (times[b].Count > 0 && times[b][times[b].Count - 1] == time)
+                {
+                    row = rows[b][rows[b].Count - 1];
+                }
+                else
+                {
+                    row = new float[dims[b]];
+                    if (rows[b].Count > 0)
+                    {
+                        Array.Copy(rows[b][rows[b].Count - 1], row, dims[b]);
+                    }
+                    times[b].Add(time);
+                    rows[b].Add(row);
+                }
+                row[componentInBinding[component]] = value;
+            }
+
+            // 1) streamed keyframes. Unity brackets the range with -FLT_MAX / +FLT_MAX
+            //    sentinel frames, AddSample drops them.
+            var frames = clip.m_StreamedClip.ReadData();
+            foreach (var frame in frames)
+            {
+                foreach (var key in frame.keyList)
+                {
+                    AddSample(key.index, frame.time, key.value);
+                }
+            }
+
+            // 2) dense per frame samples
+            var dense = clip.m_DenseClip;
+            if (denseCount > 0 && dense.m_FrameCount > 0 && dense.m_SampleRate > 0 && dense.m_SampleArray != null)
+            {
+                for (int frame = 0; frame < dense.m_FrameCount; frame++)
+                {
+                    int frameOffset = frame * denseCount;
+                    if (frameOffset + denseCount > dense.m_SampleArray.Length)
+                    {
+                        break;
+                    }
+                    float time = dense.m_BeginTime + frame / dense.m_SampleRate;
+                    for (int c = 0; c < denseCount; c++)
+                    {
+                        AddSample(streamedCount + c, time, dense.m_SampleArray[frameOffset + c]);
+                    }
+                }
+            }
+
+            // 3) constant curves, pinned to the block time range
+            var constant = clip.m_ConstantClip;
+            if (constantCount > 0 && constant?.data != null)
+            {
+                for (int c = 0; c < constantCount; c++)
+                {
+                    int component = streamedCount + denseCount + c;
+                    AddSample(component, startTime, constant.data[c]);
+                    AddSample(component, stopTime, constant.data[c]);
+                }
+            }
+
+            // 4) group the rows into curves
+            for (int i = 0; i < bindings.Count; i++)
+            {
+                if (times[i] == null || times[i].Count == 0)
+                {
+                    continue;
+                }
+                var binding = bindings[i];
+                var path = binding.path ?? string.Empty;
+                if (binding.classID == -1)
+                {
+                    switch (binding.attribute)
+                    {
+                        case "2" when dims[i] == 4:
+                            rotations.Add(BuildQuaternionCurve(path, times[i], rows[i]));
+                            continue;
+                        case "1" when dims[i] == 3:
+                            positions.Add(BuildVector3Curve(path, times[i], rows[i]));
+                            continue;
+                        case "3" when dims[i] == 3:
+                            scales.Add(BuildVector3Curve(path, times[i], rows[i]));
+                            continue;
+                        case "4" when dims[i] == 3:
+                            eulers.Add(BuildVector3Curve(path, times[i], rows[i]));
+                            continue;
+                    }
+                }
+                floats.Add(BuildFloatCurve(binding, path, times[i], rows[i]));
+            }
+        }
+
+        private static QuaternionCurve BuildQuaternionCurve(string path, List<float> times, List<float[]> rows)
+        {
+            var curve = new QuaternionCurve(path);
+            for (int k = 0; k < times.Count; k++)
+            {
+                var r = rows[k];
+                curve.curve.m_Curve.Add(new Keyframe<Quaternion>(times[k],
+                    new Quaternion(r[0], r[1], r[2], r[3]),
+                    new Quaternion(0, 0, 0, 0), new Quaternion(0, 0, 0, 0), HokQuaternionWeight));
+            }
+            return curve;
+        }
+
+        private static Vector3Curve BuildVector3Curve(string path, List<float> times, List<float[]> rows)
+        {
+            var curve = new Vector3Curve(path);
+            for (int k = 0; k < times.Count; k++)
+            {
+                var r = rows[k];
+                curve.curve.m_Curve.Add(new Keyframe<Vector3>(times[k],
+                    new Vector3(r[0], r[1], r[2]),
+                    new Vector3(0, 0, 0), new Vector3(0, 0, 0), HokVector3Weight));
+            }
+            return curve;
+        }
+
+        private static FloatCurve BuildFloatCurve(HokLegacyBinding binding, string path, List<float> times, List<float[]> rows)
+        {
+            var classID = binding.classID == -1 ? ClassIDType.Transform : (ClassIDType)binding.classID;
+            var curve = new FloatCurve(path, binding.attribute, classID, binding.script);
+            for (int k = 0; k < times.Count; k++)
+            {
+                curve.curve.m_Curve.Add(new Keyframe<Float>(times[k], new Float(rows[k][0]),
+                    new Float(0), new Float(0), HokFloatWeight));
+            }
+            return curve;
+        }
+
+        /// <summary>
+        /// Expands the HOK bit packed dense encoding into a flat
+        /// [frame][curve] float sample array.
+        /// </summary>
+        public static float[] DecodeHokSamples(int frames, uint curves, ushort[] words, IList<HokDenseRange> ranges)
+        {
+            if (frames < 0 || ranges.Sum(r => (long)r.Dimension) != curves)
+            {
+                throw new InvalidDataException("HOK dense curve dimensions mismatch.");
+            }
+
+            long bitsPerFrame = 0;
+            foreach (var r in ranges)
+            {
+                if (r.BitWidth > 16 || !float.IsFinite(r.minimum) || !float.IsFinite(r.step) || r.step < 0)
+                {
+                    throw new InvalidDataException($"Invalid HOK dense range: kind={r.kind}.");
+                }
+                // No precision byte: the older layout stores every component as a
+                // full UInt16. Newer groups encode precision in the high byte;
+                // quaternions store a three bit selector/sign and three components.
+                bitsPerFrame += r.BitWidth == 0
+                    ? r.Dimension * 16
+                    : r.GroupType == 1 ? 3 + r.BitWidth * 3 : r.Dimension * r.BitWidth;
+            }
+
+            long wordsPerFrame = (bitsPerFrame + 15) / 16;
+
+            // HOK's bit writer can retain its empty next word when the frame ends
+            // exactly on a word boundary. This is per frame padding, not another
+            // curve. Accept it only when every retained word is zero.
+            if (bitsPerFrame > 0 && bitsPerFrame % 16 == 0 && words.LongLength == frames * (wordsPerFrame + 1))
+            {
+                for (int f = 0; f < frames; f++)
+                {
+                    if (words[(f + 1) * (wordsPerFrame + 1) - 1] != 0)
+                    {
+                        throw new InvalidDataException("Nonzero HOK dense frame padding.");
+                    }
+                }
+                wordsPerFrame++;
+            }
+
+            long count = (long)frames * curves;
+            if (wordsPerFrame * frames != words.LongLength || count > 128 * 1024 * 1024)
+            {
+                throw new InvalidDataException($"HOK dense packed frame length mismatch: frames={frames}, curves={curves}, words={words.Length}, bitsPerFrame={bitsPerFrame}.");
+            }
+
+            var result = new float[checked((int)count)];
+            int output = 0;
+            for (int frame = 0; frame < frames; frame++)
+            {
+                // Every frame starts on a UInt16 boundary, not on the next bit.
+                long bit = frame * wordsPerFrame * 16;
+
+                uint ReadBits(int width)
+                {
+                    uint value = 0;
+                    for (int shift = 0; shift < width; shift++, bit++)
+                    {
+                        value |= (uint)((words[bit / 16] >> (int)(bit % 16)) & 1) << shift;
+                    }
+                    return value;
+                }
+
+                foreach (var r in ranges)
+                {
+                    if (r.GroupType == 1 && r.BitWidth != 0)
+                    {
+                        // HOK writes its selector/sign AFTER the three values.
+                        float x = r.minimum + ReadBits(r.BitWidth) * r.step;
+                        float y = r.minimum + ReadBits(r.BitWidth) * r.step;
+                        float z = r.minimum + ReadBits(r.BitWidth) * r.step;
+                        uint flags = ReadBits(3);
+                        int omitted = (int)(flags & 3);
+                        double sum = 0;
+                        int stored = 0;
+                        for (int c = 0; c < 4; c++)
+                        {
+                            if (c == omitted)
+                            {
+                                continue;
+                            }
+                            float value = stored == 0 ? x : stored == 1 ? y : z;
+                            stored++;
+                            result[output + c] = value;
+                            sum += (double)value * value;
+                        }
+                        if (sum > 1.01 || !double.IsFinite(sum))
+                        {
+                            throw new InvalidDataException("Invalid HOK packed quaternion components.");
+                        }
+                        // HOK selector bit 2 SET means POSITIVE.
+                        result[output + omitted] = (float)Math.Sqrt(Math.Max(0, 1 - sum)) * ((flags & 4) != 0 ? 1 : -1);
+                        output += 4;
+                    }
+                    else
+                    {
+                        for (int c = 0; c < r.Dimension; c++)
+                        {
+                            result[output++] = r.minimum + ReadBits(r.BitWidth == 0 ? 16 : r.BitWidth) * r.step;
+                        }
+                    }
+                }
+            }
+
+            if (result.Any(v => !float.IsFinite(v)))
+            {
+                throw new InvalidDataException("Non-finite HOK dense samples.");
+            }
+            return result;
+        }
+    }
+
     public class ValueConstant
     {
         public uint m_ID;
@@ -1310,6 +1829,7 @@ namespace AssetStudio
         public DenseClip m_DenseClip;
         public ConstantClip m_ConstantClip;
         public ValueArrayConstant m_Binding;
+        public byte[] m_HokUnknownExtension;
         public Clip() { }
 
         public Clip(ObjectReader reader)
@@ -1347,7 +1867,12 @@ namespace AssetStudio
             {
                 m_Binding = new ValueArrayConstant(reader);
             }
+            if (HokAnimationLayout.Applies(reader))
+            {
+                m_HokUnknownExtension = reader.ReadBytes(36);
+            }
         }
+
         public static Clip ParseGI(ObjectReader reader)
         {
             var clipOffset = reader.Position + reader.ReadInt64();
@@ -1826,11 +2351,13 @@ namespace AssetStudio
         public float m_SampleRate;
         public int m_WrapMode;
         public AABB m_Bounds;
+        public HokLegacyAnimation m_HokLegacyAnimation;
         public uint m_MuscleClipSize;
         public ClipMuscleConstant m_MuscleClip;
         public AnimationClipBindingConstant m_ClipBindingConstant;
         public List<AnimationEvent> m_Events;
         public StreamingInfo m_StreamData;
+        public byte[] m_HokUnknownTrailing;
 
         private bool hasStreamingInfo = false;
 
@@ -1939,6 +2466,12 @@ namespace AssetStudio
             {
                 m_Bounds = new AABB(reader);
             }
+            if (HokAnimationLayout.Applies(reader))
+            {
+                // HOK stores a self contained legacy animation block (its own Clip
+                // plus a path/binding table) between m_Bounds and m_MuscleClipSize.
+                m_HokLegacyAnimation = new HokLegacyAnimation(reader);
+            }
             if (version[0] >= 4)//4.0 and up
             {
                 if (reader.Game.Type.IsGI())
@@ -1995,6 +2528,15 @@ namespace AssetStudio
             {
                 reader.AlignStream();
             }
+            if (HokAnimationLayout.Applies(reader))
+            {
+                long remaining = reader.byteStart + reader.byteSize - reader.Position;
+                if (remaining < 0 || remaining > int.MaxValue)
+                {
+                    throw new InvalidDataException("HOK animation crossed object boundary.");
+                }
+                m_HokUnknownTrailing = reader.ReadBytes((int)remaining);
+            }
             if (hasStreamingInfo)
             {
                 m_StreamData = new StreamingInfo(reader);
@@ -2011,6 +2553,13 @@ namespace AssetStudio
 
                     aclClip.m_DatabaseData = ms.ToArray();
                 }
+            }
+            if (HokAnimationLayout.Applies(reader) && m_HokLegacyAnimation != null)
+            {
+                // HOK legacy clips keep every curve inside the embedded block, the
+                // regular curve lists on disk are empty. Rebuild them so the
+                // YAML/FBX exporters can emit the animation.
+                m_HokLegacyAnimation.BuildCurves(m_RotationCurves, m_PositionCurves, m_ScaleCurves, m_EulerCurves, m_FloatCurves);
             }
         }
     }
